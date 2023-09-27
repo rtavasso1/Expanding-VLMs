@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Logs
+*.log
+
+# Environment files
+.env
+.venv
+
+# Package directories
+dist/
+build/
+
+# Unit test / coverage reports
+htmlcov/
+.coverage
+
+# IDEs
+.idea/
+.vscode/
