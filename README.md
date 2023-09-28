@@ -1,4 +1,4 @@
-# IMU-CLIP Encoder Trainer
+# Expanding Vision Language Models with a Shared Embedding Space
 
 ## Overview
 
