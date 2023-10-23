@@ -6,9 +6,11 @@ __pycache__/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+example.ipynb
 
 # Logs
 *.log
+wandb/
 
 # Environment files
 .env
@@ -25,3 +27,16 @@ htmlcov/
 # IDEs
 .idea/
 .vscode/
+
+# Dataset
+acc_phone_clip/
+acc_watch_clip/
+gyro_clip/
+orientation_clip/
+video/
+data/
+*.mp4
+*.csv
+
+# Checkpoints
+*.pt

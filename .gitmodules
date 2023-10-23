@@ -1,0 +1,6 @@
+[submodule "expanding-vlms/Otter"]
+	path = expanding-vlms/Otter
+	url = https://github.com/Luodian/Otter
+[submodule "expanding_vlms/Otter"]
+	path = expanding_vlms/Otter
+	url = https://github.com/Luodian/Otter
