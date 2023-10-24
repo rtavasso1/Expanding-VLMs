@@ -197,8 +197,8 @@ def prepare_dataloader(dataset, test_size=0.2, batch_size=128, shuffle=True, num
     train_dataset = My_Dataset(imu_train, video_train, y_train)
     test_dataset = My_Dataset(imu_test, video_test, y_test)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn, num_workers=num_workers, worker_init_fn=seed_worker, drop_last=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn, num_workers=num_workers, worker_init_fn=seed_worker)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn, num_workers=num_workers, worker_init_fn=seed_worker, drop_last=True, pin_memory=True, prefetch_factor=1)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn, num_workers=num_workers, worker_init_fn=seed_worker, pin_memory=True, prefetch_factor=1)
 
     return train_loader, test_loader, label_mapping
 

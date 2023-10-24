@@ -1,25 +1,26 @@
 # General settings
 use_wandb: false
-root_dirs: ['../acc_watch_clip', '../acc_phone_clip', '../gyro_clip', '../orientation_clip']
-video_root_dir: '../video'
+root_dirs: ['../data/acc_watch_clip', '../data/acc_phone_clip', '../data/gyro_clip', '../data/orientation_clip']
+video_root_dir: '../data/video'
 checkpoint_dir: "../Checkpoints"
 
 # Data settings
-batch_size: 32
-num_workers: 0
+batch_size: 4
+num_workers: 4
 
 # Model settings
 pooled: false
-supervised_on_pooled: false
+supervised_on_perceiver: false
 metrics_on_perceiver: true
 
 # Loss function settings
 use_supervised_loss: true
 use_contrastive_loss: true
+n_components: 2
 
 # Optimizer settings
 learning_rate: 0.0003
-num_training_steps: 10000
+num_training_steps: 100
 dropout: 0.0
 
 # Scheduler settings

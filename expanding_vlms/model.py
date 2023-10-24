@@ -9,8 +9,9 @@ from Otter.src.otter_ai.models.flamingo.modeling_flamingo import FlamingoPerceiv
 from einops import rearrange
 from typing import Tuple, Optional, Union
 import math
+from utils import load_pretrained_perceiver_from_file
 
-device = 'cpu' # torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class LayerNorm(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
@@ -154,6 +155,8 @@ class VisionTransformer(nn.Module):
 
         x = self.projection(x) if hasattr(self, "projection") else x
 
+        self.cls = x[:, 0, :]
+
         if pooled:
             return x[:, 0, :]
         else:
@@ -202,25 +205,22 @@ class perceivingContrastive(nn.Module):
         self.video_encoder = videoFrameEncoder()
         freeze_params(self.video_encoder)
 
-        self.perceiver = FlamingoPerceiverResampler(dim=projection)
-        # self.perceiver.load_state_dict(torch.load('./otter/perceiverModule.pt'))
+        self.perceiver = load_pretrained_perceiver_from_file('./mpt7b_perceiver.pt', dim=1024)
         freeze_params(self.perceiver)
         
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
     
-    def forward(self, imu: torch.Tensor, video: torch.Tensor, pooled: bool = False, supervised_on_pooled: bool = False) -> Tuple:
+    def forward(self, imu: torch.Tensor, video: torch.Tensor, pooled: bool = False, supervised_on_perceiver: bool = False) -> Tuple:
         use_perceiver = not pooled # if pooled is true, use_perceiver is false, if pooled is false, use_perceiver is true
         imu_features, video_features = self.encode_features(imu, video, pooled)
         
         if use_perceiver: # pooled refers to encoder output, not perceiver output, perceiver output is always pooled
-            print('--------------', imu_features.shape, video_features.shape)
             imu_features_perceiver = self.perceiver_pass(imu_features)
             video_features_perceiver = self.perceiver_pass(video_features)
-            print('--------------', imu_features_perceiver.shape, video_features_perceiver.shape)
         else:
             imu_features_perceiver = video_features_perceiver = None
             
-        pred = self.imu_encoder.class_logits(imu_features, imu_features_perceiver, supervised_on_pooled)
+        pred = self.imu_encoder.class_logits(self.imu_encoder.cls, imu_features_perceiver, supervised_on_perceiver) # Always pass in cls rather than imu_features b/c if supervised_on_perceiver is false, and pooled is false, there is a shape mismatch
         
         logits_per_imu, logits_per_video = self.compute_logits(imu_features, video_features, imu_features_perceiver, video_features_perceiver, use_perceiver)
         
@@ -232,7 +232,7 @@ class perceivingContrastive(nn.Module):
         return imu_features, video_features
     
     def perceiver_pass(self, features: torch.Tensor) -> torch.Tensor:
-        return self.perceiver(features.unsqueeze(2).unsqueeze(2)).squeeze().mean(1)
+        return self.perceiver(features.unsqueeze(2).unsqueeze(2)).squeeze().mean(1).mean(1)
     
     def compute_logits(self, imu_features: torch.Tensor, video_features: torch.Tensor, imu_features_perceiver: Optional[torch.Tensor], video_features_perceiver: Optional[torch.Tensor], use_perceiver: bool) -> Tuple[torch.Tensor, torch.Tensor]:
         logit_scale = self.logit_scale.exp()

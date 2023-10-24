@@ -7,9 +7,15 @@ from model import perceivingContrastive
 from data import load_all_data, prepare_dataloader
 import argparse
 import yaml
-
+import os
 import sys
-sys.path.append("c:\\Users\\Riley\\Desktop\\SummerProject\\2023AndBeyond\\Expanding-VLMs\\expanding_vlms\\Otter\\src")
+
+# Get the current directory of the script
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Append the relative path to Otter/src from the current directory
+sys.path.append(os.path.join(current_dir, "Otter", "src"))
+
 
 # Load the config from the file into a dictionary
 def load_config(path):
@@ -19,7 +25,6 @@ def load_config(path):
 
 def compute_loss(use_supervised_loss, use_contrastive_loss, logits_per_imu, logits_per_video, pred, y, lossfcn, contrastive_labels):
     if use_supervised_loss:
-        print('----------------------',pred.shape,y.shape)
         supervised_loss = lossfcn(pred, y)
     else:
         supervised_loss = 0
@@ -35,10 +40,6 @@ def compute_CCA(imu_features: torch.Tensor, video_features: torch.Tensor, n_comp
     # assert features are of shape (B, C)
     assert imu_features.shape == video_features.shape
     assert len(imu_features.shape) == 2
-
-    # Assume imu_features and video_features are numpy arrays of shape (B, C)
-    imu_features = imu_features.cpu().numpy()
-    video_features = video_features.cpu().numpy()
     
     cca = CCA(n_components=n_components) # TODO: What is the best number of components?
     cca.fit(imu_features, video_features)
@@ -78,59 +79,62 @@ def compute_metrics(logits_per_imu, logits_per_video, imu_features, video_featur
     video_features = video_features[index]
 
     avg_cosine_similarity = compute_avg_cosine_similarity(logits_per_imu, logits_per_video)
-    avg_mutual_info = compute_mutual_info(imu_features.cpu().numpy(), video_features.cpu().numpy())
-    avg_cca = compute_CCA(imu_features, video_features, n_components)
+    avg_mutual_info = compute_mutual_info(imu_features.detach().cpu().numpy(), video_features.detach().cpu().numpy())
+    avg_cca = compute_CCA(imu_features.detach().cpu().numpy(), video_features.detach().cpu().numpy(), n_components)
     return avg_cosine_similarity, avg_mutual_info, avg_cca
 
-def train_one_epoch(model, dataloader, optimizer, lr_scheduler, lossfcn, device, config):
+def train_one_epoch(model, dataloader, optimizer, lr_scheduler, lossfcn, device, config, global_step=0):
     model.train()
     epoch_train_loss = torch.tensor(0.0).to(device)
     for i, (imu, video, y) in enumerate(dataloader):
-        imu, video, y = imu.to(device), video.to(device), y.to(device)
-        optimizer.zero_grad()
-        contrastive_labels = torch.arange(len(imu)).to(device)
+        with torch.profiler.profile(profile_memory=True) as prof:
+            imu, video, y = imu.to(device), video.to(device), y.to(device)
+            optimizer.zero_grad()
+            contrastive_labels = torch.arange(len(imu)).to(device)
 
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
-            logits_per_imu, logits_per_video, pred, imu_features, video_features = model(imu=imu, 
-                                                                                            video=video, 
-                                                                                            pooled=config.pooled, 
-                                                                                            supervised_on_pooled=config.supervised_on_pooled)
-            loss = compute_loss(config.use_supervised_loss, 
-                                config.use_contrastive_loss, 
-                                logits_per_imu, 
-                                logits_per_video, 
-                                pred, 
-                                y, 
-                                lossfcn, 
-                                contrastive_labels)
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                logits_per_imu, logits_per_video, pred, imu_features, video_features = model(imu=imu, 
+                                                                                                video=video, 
+                                                                                                pooled=config.pooled, 
+                                                                                                supervised_on_perceiver=config.supervised_on_perceiver)
+                loss = compute_loss(config.use_supervised_loss, 
+                                    config.use_contrastive_loss, 
+                                    logits_per_imu, 
+                                    logits_per_video, 
+                                    pred, 
+                                    y, 
+                                    lossfcn, 
+                                    contrastive_labels)
 
-        loss.backward()
-        optimizer.step()
-        lr_scheduler.step()
+            loss.backward()
+            optimizer.step()
+            lr_scheduler.step()
 
-        # Calculate and log additional metrics
-        avg_cosine_similarity_train, avg_mutual_info_train, avg_cca_train = compute_metrics(logits_per_imu, 
-                                                                                            logits_per_video, 
-                                                                                            imu_features, 
-                                                                                            video_features,
-                                                                                            config.metrics_on_perceiver)
+            # Calculate and log additional metrics
+            avg_cosine_similarity_train, avg_mutual_info_train, avg_cca_train = compute_metrics(logits_per_imu, 
+                                                                                                logits_per_video, 
+                                                                                                imu_features, 
+                                                                                                video_features,
+                                                                                                config.metrics_on_perceiver,
+                                                                                                config.n_components)
 
-        wandb.log({
-            "Global Step": global_step,
-            "Train Loss": loss.cpu().item(),
-            "Avg Cosine Similarity Train": avg_cosine_similarity_train.cpu().item(),
-            "Avg Mutual Info Train": avg_mutual_info_train,
-            "Avg CCA Train": avg_cca_train
-        })
+            wandb.log({
+                "Global Step": global_step,
+                "Train Loss": loss.cpu().item(),
+                "Avg Cosine Similarity Train": avg_cosine_similarity_train.cpu().item(),
+                "Avg Mutual Info Train": avg_mutual_info_train,
+                "Avg CCA Train": avg_cca_train
+            })
 
-        # Increment global_step
-        global_step += 1
+            # Increment global_step
+            global_step += 1
+        print(prof.key_averages().table(sort_by="self_cpu_time_total"))
 
         epoch_train_loss += loss.detach()
         
     return (epoch_train_loss / len(dataloader)).cpu().item()
 
-def validate(model, dataloader, lossfcn, device, config):
+def validate(model, dataloader, lossfcn, device, config, global_step=0):
     model.eval()
     epoch_test_loss = torch.tensor(0.0).to(device)
 
@@ -148,7 +152,7 @@ def validate(model, dataloader, lossfcn, device, config):
                 logits_per_imu, logits_per_video, pred, imu_features, video_features = model(imu=imu, 
                                                                                              video=video, 
                                                                                              pooled=config.pooled, 
-                                                                                             supervised_on_pooled=config.supervised_on_pooled)
+                                                                                             supervised_on_perceiver=config.supervised_on_perceiver)
                 loss = compute_loss(config.use_supervised_loss, 
                                     config.use_contrastive_loss, 
                                     logits_per_imu, 
@@ -163,7 +167,8 @@ def validate(model, dataloader, lossfcn, device, config):
                                                                                           logits_per_video, 
                                                                                           imu_features, 
                                                                                           video_features,
-                                                                                          config.metrics_on_perceiver)
+                                                                                          config.metrics_on_perceiver,
+                                                                                          config.n_components)
             
             avg_cosine_similarity_vals.append(avg_cosine_similarity_val.cpu().item())
             avg_mutual_info_vals.append(avg_mutual_info_val)
@@ -216,7 +221,7 @@ if __name__ == "__main__":
         wandb.init(project="Contrastive Learning Ablations", config=config, mode="disabled")
 
     global_step = 0
-    device = 'cpu' #torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     dataset = load_all_data(wandb.config.root_dirs, wandb.config.video_root_dir)
     train_dataloader, test_dataloader, label_mapping = prepare_dataloader(dataset, batch_size=wandb.config.batch_size, num_workers=wandb.config.num_workers)
@@ -227,10 +232,10 @@ if __name__ == "__main__":
     lossfcn = torch.nn.CrossEntropyLoss()
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=wandb.config.num_training_steps, eta_min=1e-5)
 
-    early_stopping = EarlyStopping(patience=5)
+    early_stopping = EarlyStopping(patience=wandb.config.early_stopping_patience, delta=wandb.config.early_stopping_delta)
 
     for epoch in range(wandb.config.num_epochs):
-        avg_train_loss = train_one_epoch(model, train_dataloader, optimizer, lr_scheduler, lossfcn, device, wandb.config)
+        avg_train_loss = train_one_epoch(model, train_dataloader, optimizer, lr_scheduler, lossfcn, device, wandb.config, global_step=global_step)
         wandb.log({"Epoch": epoch, "Avg Train Loss": avg_train_loss})
 
         checkpoint_filename = f"{wandb.config.checkpoint_dir}/epoch{epoch}_avg_train_loss_{avg_train_loss:.3f}.pt"
@@ -241,7 +246,7 @@ if __name__ == "__main__":
             'loss': avg_train_loss,
         }, checkpoint_filename)
 
-        avg_test_loss = validate(model, test_dataloader, lossfcn, device, wandb.config)
+        avg_test_loss = validate(model, test_dataloader, lossfcn, device, wandb.config, global_step=global_step)
         wandb.log({"Epoch": epoch, "Avg Test Loss": avg_test_loss})
 
         if early_stopping(avg_test_loss):
