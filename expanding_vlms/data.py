@@ -238,6 +238,7 @@ def sample_imu_window(imu_data, length=256):
             padding = torch.zeros(length - T, X.shape[1])
             sampled_X = torch.cat([X, padding], dim=0)
         sampled_imu_Xs.append(sampled_X)
+    return sampled_imu_Xs
     
 def collate_fn(batch):
     imu_Xs, video_paths, ys = zip(*batch)
