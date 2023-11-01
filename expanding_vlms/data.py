@@ -10,6 +10,7 @@ import random
 import cv2
 from sklearn.model_selection import train_test_split
 import pandas as pd
+import pickle
 
 def butter_lowpass(cutoff, fs, order=5):
         nyq = 0.5 * fs  # Nyquist Frequency
@@ -95,6 +96,24 @@ def load_activity(activity_paths):
     return tensor_data
 
 def load_all_data(root_dirs, video_root_dir):
+    """
+    Load precomputed embeddings, otherwise, go thru files and build dict
+    of video filepaths and corresponding IMU data
+    
+    Args:
+        root_dirs: directories containing IMU sensor signals
+        video_root_dir: directory for video paths
+    Returns:
+        dict with key of scenario, value of IMU data and video embeddings/file paths
+    """
+    if os.path.exists('./saved_weights/dataset_perceiver_embeddings_fixed.pkl'):
+        with open('./saved_weights/dataset_perceiver_embeddings_fixed.pkl', 'rb') as file:
+            return pickle.load(file)
+        
+    if os.path.exists('./saved_weights/dataset_paths.pkl'):
+        with open('./saved_weights/dataset_paths.pkl', 'rb') as file:
+            return pickle.load(file)
+    
     dataset = {}
     
     for subj in range(1, 21):
@@ -133,26 +152,99 @@ def load_all_data(root_dirs, video_root_dir):
                         activity_data = load_activity(activity_paths)
                         
                         if activity_data is not None and video_paths is not None:
-                            key = f'subject{4}_scene{scene}_session{sess}_{activity_name}'
+                            key = f'subject{subj}_scene{scene}_session{sess}_{activity_name}'
                             dataset[key] = (activity_data, video_paths)
 
     return dataset
 
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+    
+"""
+Below are the definitions for 3 distinct datasets, collate fns, and dataloaders.
+Each is designed to handle a different video input: video paths, video embeddings, 
+and video perceiver embeddings. To save training costs, I precompute these static 
+embeddings and save them to a file, loading them on the fly. The most efficient
+training is done using the precomputed perceiver embeddings. 
+"""
+
+class Video_Path_Dataset(Dataset):
+    def __init__(self, imu, video_paths, label):
+        self.imu = imu
+        self.video_paths = video_paths
+        self.label = label
+    
+    def __len__(self):
+        return len(self.label)
+    
+    def __getitem__(self, idx):
+        video_path = random.choice(self.video_paths[idx])
+        return self.imu[idx], video_path, self.label[idx]
+    
+class Video_Embeddings_Dataset(Dataset):
+    def __init__(self, imu, video, label):
+        self.imu = imu
+        self.video = video
+        self.label = label
+    
+    def __len__(self):
+        return len(self.label)
+    
+    def __getitem__(self, idx):
+        # Randomly permute the indices of the rows
+        permuted_indices = torch.randperm(self.video[idx].size(0))
+
+        # Get the index of the first randomly permuted row
+        random_row_index = permuted_indices[0]
+
+        # Select the random row using the index
+        random_cam = self.video[idx][random_row_index]
+        
+        return self.imu[idx], random_cam, self.label[idx]
+    
+class Video_Perceiver_Dataset(Dataset):
+    def __init__(self, imu, video_class, video_perceiver, label):
+        self.imu = imu
+        self.video_class = video_class
+        self.video_perceiver = video_perceiver
+        self.label = label
+    
+    def __len__(self):
+        return len(self.label)
+    
+    def __getitem__(self, idx):
+        # Randomly permute the indices of the rows
+        permuted_indices = torch.randperm(self.video_class[idx].size(0))
+
+        # Get the index of the first randomly permuted row
+        random_row_index = permuted_indices[0]
+
+        # Select the random row using the index
+        random_video_class = self.video_class[idx][random_row_index]
+        random_video_perceiver = self.video_perceiver[idx][random_row_index]
+        
+        return self.imu[idx], random_video_class, random_video_perceiver, self.label[idx]
+
+def sample_imu_window(imu_data, length=256):
+    sampled_imu_Xs = []
+    for X in imu_data:
+        T = X.shape[0]
+        if T >= length:
+            start_idx = random.randint(0, T - length)
+            sampled_X = X[start_idx:start_idx + length, :]
+        else:
+            padding = torch.zeros(length - T, X.shape[1])
+            sampled_X = torch.cat([X, padding], dim=0)
+        sampled_imu_Xs.append(sampled_X)
+    
 def collate_fn(batch):
     imu_Xs, video_paths, ys = zip(*batch)
-    sampled_imu_Xs = []
     sampled_video_Xs = []
     
     # Handle IMU data
-    for X in imu_Xs:
-        T = X.shape[0]
-        if T >= 256:
-            start_idx = random.randint(0, T - 256)
-            sampled_X = X[start_idx:start_idx + 256, :]
-        else:
-            padding = torch.zeros(256 - T, X.shape[1])
-            sampled_X = torch.cat([X, padding], dim=0)
-        sampled_imu_Xs.append(sampled_X)
+    sampled_imu_Xs = sample_imu_window(imu_Xs, length=256)
 
     # Handle video data
     for video_path in video_paths:
@@ -164,11 +256,22 @@ def collate_fn(batch):
     
     return torch.stack(sampled_imu_Xs), torch.stack(sampled_video_Xs).squeeze(), torch.tensor(ys, dtype=torch.long)
 
-def seed_worker(worker_id):
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
+def collate_fn_precomputed_embeddings(batch):
+    imu_Xs, videos, ys = zip(*batch)
+    
+    # Handle IMU data
+    sampled_imu_Xs = sample_imu_window(imu_Xs, length=256)
+    
+    return torch.stack(sampled_imu_Xs), torch.stack(videos).squeeze(), torch.tensor(ys, dtype=torch.long)
 
+def collate_fn_precomputed_perceiver_embeddings(batch):
+    imu_Xs, videos_class, videos_perceiver, ys = zip(*batch)
+    
+    # Handle IMU data
+    sampled_imu_Xs = sample_imu_window(imu_Xs, length=256)
+    
+    return torch.stack(sampled_imu_Xs), torch.stack(videos_class).squeeze(), torch.stack(videos_perceiver).squeeze(), torch.tensor(ys, dtype=torch.long)
+    
 def prepare_dataloader(dataset, test_size=0.2, batch_size=128, shuffle=True, num_workers=4, worker_init_fn=seed_worker):
     imu_x_data = []
     video_x_data = []
@@ -194,40 +297,78 @@ def prepare_dataloader(dataset, test_size=0.2, batch_size=128, shuffle=True, num
     y_train = torch.tensor(y_train, dtype=torch.int64)
     y_test = torch.tensor(y_test, dtype=torch.int64)
 
-    train_dataset = My_Dataset(imu_train, video_train, y_train)
-    test_dataset = My_Dataset(imu_test, video_test, y_test)
+    train_dataset = Video_Path_Dataset(imu_train, video_train, y_train)
+    test_dataset = Video_Path_Dataset(imu_test, video_test, y_test)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn, num_workers=num_workers, worker_init_fn=seed_worker, drop_last=True, pin_memory=True, prefetch_factor=1)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn, num_workers=num_workers, worker_init_fn=seed_worker, pin_memory=True, prefetch_factor=1)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn, num_workers=num_workers, worker_init_fn=seed_worker, drop_last=True, pin_memory=True, prefetch_factor=batch_size//num_workers)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn, num_workers=num_workers, worker_init_fn=seed_worker, pin_memory=True, prefetch_factor=batch_size//num_workers)
+
+    return train_loader, test_loader, label_mapping
+    
+def prepare_dataloader_precomputed_embeddings(dataset, test_size=0.2, batch_size=128, shuffle=True, num_workers=4, worker_init_fn=seed_worker):
+    imu_x_data = []
+    video_x_data = []
+    y_data = []
+    label_mapping = {}
+    label_count = 0
+
+    for key, (imu_tensor_data, video_data) in dataset.items():
+        imu_x_data.append(imu_tensor_data)
+        video_x_data.append(video_data)
+        
+        activity_name = key.split('_')[-1]
+        if activity_name not in label_mapping:
+            label_mapping[activity_name] = label_count
+            label_count += 1
+
+        y_data.append(label_mapping[activity_name])
+
+    # Split the data
+    imu_train, imu_test, video_train, video_test, y_train, y_test = train_test_split(
+        imu_x_data, video_x_data, y_data, test_size=test_size, random_state=42)
+
+    y_train = torch.tensor(y_train, dtype=torch.int64)
+    y_test = torch.tensor(y_test, dtype=torch.int64)
+
+    train_dataset = Video_Embeddings_Dataset(imu_train, video_train, y_train)
+    test_dataset = Video_Embeddings_Dataset(imu_test, video_test, y_test)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn_precomputed_embeddings, num_workers=0, worker_init_fn=seed_worker, drop_last=True, pin_memory=True, prefetch_factor=batch_size//num_workers)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn_precomputed_embeddings, num_workers=0, worker_init_fn=seed_worker, pin_memory=True, prefetch_factor=batch_size//num_workers)
 
     return train_loader, test_loader, label_mapping
 
-class My_Dataset(Dataset):
-    def __init__(self, imu, video_paths, label):
-        self.imu = imu
-        self.video_paths = video_paths
-        self.label = label
-    
-    def __len__(self):
-        return len(self.label)
-    
-    def __getitem__(self, idx):
-        video_path = random.choice(self.video_paths[idx])
-        return self.imu[idx], video_path, self.label[idx]
+def prepare_dataloader_precomputed_perceiver_embeddings(dataset, test_size=0.2, batch_size=128, shuffle=True, num_workers=4, worker_init_fn=seed_worker):
+    imu_x_data = []
+    video_class_data = []
+    video_perceiver_data = []
+    y_data = []
+    label_mapping = {}
+    label_count = 0
 
-class dictionaryFilepathLoader(Dataset):
-    def __init__(self, listOfDicts):
-        self.listOfDicts = listOfDicts
+    for key, (imu_tensor_data, video_class, video_perceiver) in dataset.items():
+        imu_x_data.append(imu_tensor_data)
+        video_class_data.append(video_class)
+        video_perceiver_data.append(video_perceiver)
         
-    def __len__(self):
-        return len(self.listOfDicts)
-    
-    def __getitem__(self, idx):
-        interp = self.listOfDicts[idx]['interp']
-        imu = self.listOfDicts[idx]['imu']
-        imu = self.extract_imu_windows(imu, 1, interp)
-        imu = torch.from_numpy(imu).float()
-        num_videos = len(self.listOfDicts[idx]['video'])
-        video_num = np.random.randint(num_videos)
-        video = self.listOfDicts[idx]['vid_embeds'][video_num]
-        return video, imu, torch.tensor(interp)
+        activity_name = key.split('_')[-1]
+        if activity_name not in label_mapping:
+            label_mapping[activity_name] = label_count
+            label_count += 1
+
+        y_data.append(label_mapping[activity_name])
+
+    # Split the data
+    imu_train, imu_test, video_class_train, video_class_test, video_perceiver_train, video_perceiver_test, y_train, y_test = train_test_split(
+        imu_x_data, video_class_data, video_perceiver_data, y_data, test_size=test_size, random_state=42)
+
+    y_train = torch.tensor(y_train, dtype=torch.int64)
+    y_test = torch.tensor(y_test, dtype=torch.int64)
+
+    train_dataset = Video_Perceiver_Dataset(imu_train, video_class_train, video_perceiver_train, y_train)
+    test_dataset = Video_Perceiver_Dataset(imu_test, video_class_test, video_perceiver_test, y_test)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn_precomputed_perceiver_embeddings, num_workers=num_workers, worker_init_fn=seed_worker, drop_last=True, pin_memory=True, prefetch_factor=batch_size//num_workers)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn_precomputed_perceiver_embeddings, num_workers=num_workers, worker_init_fn=seed_worker, pin_memory=True, prefetch_factor=batch_size//num_workers)
+
+    return train_loader, test_loader, label_mapping

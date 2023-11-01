@@ -92,7 +92,6 @@ def train_one_epoch(model, dataloader, optimizer, lr_scheduler, lossfcn, device,
     model.train()
     epoch_train_loss = torch.tensor(0.0).to(device)
     for i, (imu, video_class, video_perceiver, y) in enumerate(dataloader):
-        #with torch.profiler.profile(profile_memory=True) as prof:
         imu, video_class, video_perceiver, y = imu.to(device), video_class.to(device), video_perceiver.to(device), y.to(device)
         optimizer.zero_grad()
         contrastive_labels = torch.arange(len(imu)).to(device)
@@ -102,8 +101,8 @@ def train_one_epoch(model, dataloader, optimizer, lr_scheduler, lossfcn, device,
                                                                                             video_class=video_class,
                                                                                             video_perceiver=video_perceiver,
                                                                                             use_perceiver=config.use_perceiver, 
-                                                                                            supervised_on_perceiver=config.supervised_on_perceiver)
-            #print_memory("After Forward Pass")
+                                                                                            supervised_on_perceiver=config.supervised_on_perceiver,
+                                                                                            use_perceiver_on_video_only=config.use_perceiver_on_video_only)
             loss = compute_loss(config.use_supervised_loss, 
                                 config.use_contrastive_loss, 
                                 logits_per_imu, 
@@ -112,7 +111,6 @@ def train_one_epoch(model, dataloader, optimizer, lr_scheduler, lossfcn, device,
                                 y, 
                                 lossfcn, 
                                 contrastive_labels)
-            #print_memory("After Loss Pass")
 
         loss.backward()
         optimizer.step()
@@ -133,8 +131,6 @@ def train_one_epoch(model, dataloader, optimizer, lr_scheduler, lossfcn, device,
             "Avg Mutual Info Train": avg_mutual_info_train,
             "Avg CCA Train": avg_cca_train
         })
-
-        #print(prof.key_averages().table(sort_by="self_cuda_memory_usage"))
 
         epoch_train_loss += loss.detach()
         
@@ -159,7 +155,8 @@ def validate(model, dataloader, lossfcn, device, config):
                                                                                              video_class=video_class,
                                                                                              video_perceiver=video_perceiver,
                                                                                              use_perceiver=config.use_perceiver, 
-                                                                                             supervised_on_perceiver=config.supervised_on_perceiver)
+                                                                                             supervised_on_perceiver=config.supervised_on_perceiver,
+                                                                                             use_perceiver_on_video_only=config.use_perceiver_on_video_only)
                 loss = compute_loss(config.use_supervised_loss, 
                                     config.use_contrastive_loss, 
                                     logits_per_imu, 
@@ -226,6 +223,7 @@ def print_memory(label):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--use_perceiver', type=bool, default=True)
+    parser.add_argument('--use_perceiver_on_video_only', type=bool, default=False)
     parser.add_argument('--T_max', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--checkpoint_dir', type=str, default='../Checkpoints')
@@ -249,14 +247,8 @@ if __name__ == "__main__":
     parser.add_argument('--config', type=str, required=False, help='Path to a specific config file')
     args = parser.parse_args()
 
-    file_config = load_config(args.config) if args.config else {}
-    # wandb_config = {k: v for k, v in wandb.config.as_dict().items()} if wandb.run else {}
-
+    file_config = load_config(args.config) if args.config else {} # If loading config from yaml rather than args
     config = merge_configs(file_config, args)
-    
-    #if config['pooled'] and config['metrics_on_perceiver']:
-    #    print("Invalid configuration: pooled and metrics_on_perceiver can't both be True.")
-    #    sys.exit(1)  # Exit the script
 
 
     if config.get('use_wandb', True):
@@ -274,7 +266,7 @@ if __name__ == "__main__":
 
     model = perceivingContrastive(patch_size=wandb.config.patch_size, padding=wandb.config.padding, dropout=wandb.config.dropout).to(device)
     print('Number of Model Parameters', sum([param.nelement() for param in model.parameters()]), '\n', 'Trainable params: ', sum([param.nelement() for param in model.parameters() if param.requires_grad]))
-    print_memory("Before Forward Pass")
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=wandb.config.learning_rate)
     lossfcn = torch.nn.CrossEntropyLoss()
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=wandb.config.num_training_steps, eta_min=1e-5)
@@ -294,7 +286,6 @@ if __name__ == "__main__":
         }, checkpoint_filename)
 
         avg_test_loss = validate(model, test_dataloader, lossfcn, device, wandb.config)
-        #wandb.log({"Epoch": epoch, "Avg Test Loss": avg_test_loss})
 
         if early_stopping(avg_test_loss):
             print("Early stopping triggered.")

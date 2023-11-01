@@ -1,5 +1,3 @@
-
-# Import necessary libraries
 import torch
 import torch.nn as nn
 from collections import OrderedDict
@@ -10,6 +8,7 @@ from einops import rearrange
 from typing import Tuple, Optional, Union
 import math
 from utils import load_pretrained_perceiver_from_file
+import torch.utils.checkpoint as checkpoint
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -101,7 +100,8 @@ def freeze_params(module: nn.Module):
 class VisionTransformer(nn.Module):
     def __init__(self, 
                  input_channels: int, 
-                 patch_size: int, width: int, 
+                 patch_size: int, 
+                 width: int, 
                  sequence_length: int, 
                  num_heads: int, 
                  num_layers: int, 
@@ -135,7 +135,7 @@ class VisionTransformer(nn.Module):
         if num_classes is not None:
             self.head = nn.Linear(projection if projection is not None else width, num_classes)
 
-    def forward(self, x: torch.Tensor, pooled: bool = False):
+    def forward(self, x: torch.Tensor):
         x = self.prenorm(x)
         x = x.permute(0,2,1)
         x = self.conv1d(x)
@@ -156,11 +156,9 @@ class VisionTransformer(nn.Module):
         x = self.projection(x) if hasattr(self, "projection") else x
 
         self.cls = x[:, 0, :]
-
-        if pooled:
-            return x[:, 0, :]
-        else:
-            return x[:, 1:, :]
+        self.last_hidden_state = x[:, 1:, 0]
+        
+        return x
         
     def class_logits(self, imu_features: torch.Tensor, imu_features_perceiver: Optional[torch.Tensor], supervised_on_perceiver: bool) -> torch.Tensor:
         if supervised_on_perceiver and imu_features_perceiver is not None:
@@ -174,16 +172,17 @@ class videoFrameEncoder(nn.Module):
         self.model = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14")
         self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
     
-    def forward(self, frames: torch.Tensor, pooled: bool = False):
+    def forward(self, frames: torch.Tensor):
         with torch.no_grad():
             inputs = self.processor(images=frames, return_tensors="pt")
             inputs['pixel_values'] = inputs['pixel_values'].to(device) # Not sure why processor moves tensor to CPU but it does
-            if pooled:
-                frame_features = self.model(**inputs).pooler_output
-            else:
-                frame_features = self.model(**inputs).last_hidden_state[:, 1:, :]
 
-        return frame_features
+            frame_features = self.model(**inputs).last_hidden_state
+
+        return frame_features   
+
+def print_memory(label):
+    print(f"{label}: Allocated: {torch.cuda.memory_allocated() / 1024 ** 2} MB, Cached: {torch.cuda.memory_cached() / 1024 ** 2} MB")
     
 class perceivingContrastive(nn.Module):
     def __init__(self,
@@ -202,49 +201,58 @@ class perceivingContrastive(nn.Module):
                  ):
         super().__init__()
         self.imu_encoder = VisionTransformer(input_channels=input_channels, patch_size=patch_size, width=width, sequence_length=sequence_length, num_heads=num_heads, num_layers=num_layers, dropout=dropout, stride=stride, padding=padding, projection=projection, num_classes=num_classes)
-        self.video_encoder = videoFrameEncoder()
-        freeze_params(self.video_encoder)
 
-        self.perceiver = load_pretrained_perceiver_from_file('./mpt7b_perceiver.pt', dim=1024)
+        self.perceiver = load_pretrained_perceiver_from_file('./saved_weights/mpt7b_perceiver.pt', dim=1024)
         freeze_params(self.perceiver)
-        
+
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
     
-    def forward(self, imu: torch.Tensor, video: torch.Tensor, pooled: bool = False, supervised_on_perceiver: bool = False) -> Tuple:
-        use_perceiver = not pooled # if pooled is true, use_perceiver is false, if pooled is false, use_perceiver is true
-        imu_features, video_features = self.encode_features(imu, video, pooled)
+    def forward(self, imu: torch.Tensor, video_class: torch.Tensor, video_perceiver: torch.Tensor, use_perceiver: bool = False, supervised_on_perceiver: bool = False, use_perceiver_on_video_only: bool = False) -> Tuple:
+        imu_features, video_features = self.encode_features(imu, video_class, video_already_encoded=True)
+        imu_features_perceiver = self.perceiver_pass(imu_features[:,1:,:])
+        video_features_perceiver = video_perceiver
+ 
+        pred = self.imu_encoder.class_logits(imu_features[:,0,:], imu_features_perceiver, supervised_on_perceiver)
         
-        if use_perceiver: # pooled refers to encoder output, not perceiver output, perceiver output is always pooled
-            imu_features_perceiver = self.perceiver_pass(imu_features)
-            video_features_perceiver = self.perceiver_pass(video_features)
-        else:
-            imu_features_perceiver = video_features_perceiver = None
-            
-        pred = self.imu_encoder.class_logits(self.imu_encoder.cls, imu_features_perceiver, supervised_on_perceiver) # Always pass in cls rather than imu_features b/c if supervised_on_perceiver is false, and pooled is false, there is a shape mismatch
+        logits_per_imu, logits_per_video = self.compute_logits(imu_features[:,0,:], video_features, imu_features_perceiver, video_features_perceiver, use_perceiver, use_perceiver_on_video_only)
         
-        logits_per_imu, logits_per_video = self.compute_logits(imu_features, video_features, imu_features_perceiver, video_features_perceiver, use_perceiver)
-        
-        return logits_per_imu, logits_per_video, pred, (imu_features, imu_features_perceiver), (video_features, video_features_perceiver)
+        return logits_per_imu, logits_per_video, pred, (imu_features[:,0,:], imu_features_perceiver), (video_features, video_features_perceiver)
     
-    def encode_features(self, imu: torch.Tensor, video: torch.Tensor, pooled: bool) -> Tuple[torch.Tensor, torch.Tensor]:
-        imu_features = self.imu_encoder(imu, pooled=pooled)
-        video_features = self.video_encoder(video, pooled=pooled)
+    def encode_features(self, imu: torch.Tensor, video: torch.Tensor, video_already_encoded: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
+        imu_features = self.imu_encoder(imu)
+        if not video_already_encoded:
+            video_features = self.video_encoder(video)
+        else:
+            video_features = video
         return imu_features, video_features
     
     def perceiver_pass(self, features: torch.Tensor) -> torch.Tensor:
-        return self.perceiver(features.unsqueeze(2).unsqueeze(2)).squeeze().mean(1).mean(1)
+        with torch.no_grad():
+            perceived = self.perceiver(features.unsqueeze(2).unsqueeze(2)).squeeze().mean(1).mean(1)
+        return perceived
     
-    def compute_logits(self, imu_features: torch.Tensor, video_features: torch.Tensor, imu_features_perceiver: Optional[torch.Tensor], video_features_perceiver: Optional[torch.Tensor], use_perceiver: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+    def cosine_similarity(self, imu, video):
         logit_scale = self.logit_scale.exp()
+        
+        imu_norm = torch.norm(imu, p=2, dim=1, keepdim=True)
+        imu_normalized = imu / imu_norm
+        
+        video_norm = torch.norm(video, p=2, dim=1, keepdim=True)
+        video_normalized = video / video_norm
+        
+        logits_per_imu = logit_scale * imu_normalized @ video_normalized.t()
+        logits_per_video = logits_per_imu.t()
+        return logits_per_imu, logits_per_video
+    
+    def compute_logits(self, imu_features: torch.Tensor, video_features: torch.Tensor, imu_features_perceiver: Optional[torch.Tensor], video_features_perceiver: Optional[torch.Tensor], use_perceiver: bool, use_perceiver_on_video_only: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+        
+        if use_perceiver_on_video_only:
+            logits_per_imu, logits_per_video = self.cosine_similarity(imu_features, video_features_perceiver)
+            return logits_per_imu, logits_per_video
+        
         if not use_perceiver:
-            normalized_imu = imu_features / imu_features.norm(dim=1, keepdim=True)
-            normalized_video = video_features / video_features.norm(dim=1, keepdim=True)
-            logits_per_imu = logit_scale * normalized_imu @ normalized_video.t()
-            logits_per_video = logits_per_imu.t()
+            logits_per_imu, logits_per_video = self.cosine_similarity(imu_features, video_features)
             return logits_per_imu, logits_per_video
 
-        normalized_imu_perceiver = imu_features_perceiver / imu_features_perceiver.norm(dim=0, keepdim=True)
-        normalized_video_perceiver = video_features_perceiver / video_features_perceiver.norm(dim=0, keepdim=True)
-        logits_per_imu = logit_scale * normalized_imu_perceiver @ normalized_video_perceiver.t()
-        logits_per_video = logits_per_imu.t()
+        logits_per_imu, logits_per_video = self.cosine_similarity(imu_features_perceiver, video_features_perceiver)
         return logits_per_imu, logits_per_video

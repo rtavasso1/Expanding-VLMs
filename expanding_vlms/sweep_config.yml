@@ -1,0 +1,49 @@
+program: train.py  # Your training script
+
+method: bayes  # Hyperparameter optimization method
+
+metric:
+  goal: minimize  # Modify as per your use case
+  name: Avg Val Loss  # Replace with your metric
+
+parameters:
+  batch_size:
+    value: 512  # Example values
+  learning_rate:
+    min: 0.0001
+    max: 0.001
+  dropout:
+    min: 0.0
+    max: 0.5
+  n_components:
+    value: 16 # [2, 4, 8, 16]
+  num_epochs:
+    value: 100
+  use_supervised_loss:
+    values: [true, false]
+  use_contrastive_loss:
+    value: true
+  checkpoint_dir:
+    value: '../Checkpoints'
+  num_workers:
+    value: 4
+  use_perceiver:
+    values: [false, true]
+  use_perceiver_on_video_only:
+    values: [false, true]
+  supervised_on_perceiver:
+    values: [false, true]
+  metrics_on_perceiver:
+    values: [true, false]
+  num_training_steps:
+    value: 1300
+  early_stopping_patience:
+    value: 10
+  early_stopping_delta:
+    value: 0.001
+  use_wandb:
+    value: true
+  patch_size:
+    values: [8, 16, 32, 64]
+  padding:
+    value: 0
