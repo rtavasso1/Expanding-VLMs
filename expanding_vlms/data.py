@@ -95,7 +95,7 @@ def load_activity(activity_paths):
     
     return tensor_data
 
-def load_all_data(root_dirs, video_root_dir):
+def load_all_data(root_dirs, video_root_dir, ignore_files=False, path=None):
     """
     Load precomputed embeddings, otherwise, go thru files and build dict
     of video filepaths and corresponding IMU data
@@ -106,13 +106,21 @@ def load_all_data(root_dirs, video_root_dir):
     Returns:
         dict with key of scenario, value of IMU data and video embeddings/file paths
     """
-    if os.path.exists('./saved_weights/dataset_perceiver_embeddings_fixed.pkl'):
-        with open('./saved_weights/dataset_perceiver_embeddings_fixed.pkl', 'rb') as file:
-            return pickle.load(file)
-        
-    if os.path.exists('./saved_weights/dataset_paths.pkl'):
-        with open('./saved_weights/dataset_paths.pkl', 'rb') as file:
-            return pickle.load(file)
+    if not ignore_files:
+        if path:
+            if os.path.exists(path):
+                with open(path, 'rb') as file:
+                    return pickle.load(file)
+            else:
+                print('Invalid path. Loading other presaved data.')
+            
+        if os.path.exists('./saved_weights/dataset_perceiver_embeddings_fixed.pkl'):
+            with open('./saved_weights/dataset_perceiver_embeddings_fixed.pkl', 'rb') as file:
+                return pickle.load(file)
+
+        if os.path.exists('./saved_weights/dataset_paths.pkl'):
+            with open('./saved_weights/dataset_paths.pkl', 'rb') as file:
+                return pickle.load(file)
     
     dataset = {}
     
@@ -204,6 +212,27 @@ class Video_Embeddings_Dataset(Dataset):
         
         return self.imu[idx], random_cam, self.label[idx]
     
+class Video_Projected_Embeddings_Dataset(Dataset):
+    def __init__(self, imu, video, label):
+        self.imu = imu
+        self.video = video
+        self.label = label
+    
+    def __len__(self):
+        return len(self.label)
+    
+    def __getitem__(self, idx):
+        # Randomly permute the indices of the rows
+        permuted_indices = torch.randperm(self.video[idx].size(0))
+
+        # Get the index of the first randomly permuted row
+        random_row_index = permuted_indices[0]
+
+        # Select the random row using the index
+        random_cam = self.video[idx][random_row_index][0] # class token
+        
+        return self.imu[idx], random_cam, self.label[idx]
+    
 class Video_Perceiver_Dataset(Dataset):
     def __init__(self, imu, video_class, video_perceiver, label):
         self.imu = imu
@@ -226,6 +255,7 @@ class Video_Perceiver_Dataset(Dataset):
         random_video_perceiver = self.video_perceiver[idx][random_row_index]
         
         return self.imu[idx], random_video_class, random_video_perceiver, self.label[idx]
+
 
 def sample_imu_window(imu_data, length=256):
     sampled_imu_Xs = []
@@ -284,7 +314,7 @@ def prepare_dataloader(dataset, test_size=0.2, batch_size=128, shuffle=True, num
         imu_x_data.append(imu_tensor_data)
         video_x_data.append(video_paths_data)
         
-        activity_name = key.split('_')[-1]
+        activity_name = '_'.join(key.split('_')[3:]).lower()
         if activity_name not in label_mapping:
             label_mapping[activity_name] = label_count
             label_count += 1
@@ -317,7 +347,7 @@ def prepare_dataloader_precomputed_embeddings(dataset, test_size=0.2, batch_size
         imu_x_data.append(imu_tensor_data)
         video_x_data.append(video_data)
         
-        activity_name = key.split('_')[-1]
+        activity_name = '_'.join(key.split('_')[3:]).lower()
         if activity_name not in label_mapping:
             label_mapping[activity_name] = label_count
             label_count += 1
@@ -339,7 +369,40 @@ def prepare_dataloader_precomputed_embeddings(dataset, test_size=0.2, batch_size
 
     return train_loader, test_loader, label_mapping
 
-def prepare_dataloader_precomputed_perceiver_embeddings(dataset, test_size=0.2, batch_size=128, shuffle=True, num_workers=4, worker_init_fn=seed_worker):
+def prepare_dataloader_precomputed_projected_embeddings(dataset, test_size=0.2, batch_size=128, shuffle=True, num_workers=4, worker_init_fn=seed_worker):
+    imu_x_data = []
+    video_x_data = []
+    y_data = []
+    label_mapping = {}
+    label_count = 0
+
+    for key, (imu_tensor_data, video_data) in dataset.items():
+        imu_x_data.append(imu_tensor_data)
+        video_x_data.append(video_data)
+        
+        activity_name = '_'.join(key.split('_')[3:]).lower()
+        if activity_name not in label_mapping:
+            label_mapping[activity_name] = label_count
+            label_count += 1
+
+        y_data.append(label_mapping[activity_name])
+
+    # Split the data
+    imu_train, imu_test, video_train, video_test, y_train, y_test = train_test_split(
+        imu_x_data, video_x_data, y_data, test_size=test_size, random_state=42)
+
+    y_train = torch.tensor(y_train, dtype=torch.int64)
+    y_test = torch.tensor(y_test, dtype=torch.int64)
+
+    train_dataset = Video_Projected_Embeddings_Dataset(imu_train, video_train, y_train)
+    test_dataset = Video_Projected_Embeddings_Dataset(imu_test, video_test, y_test)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn_precomputed_embeddings, num_workers=num_workers, worker_init_fn=seed_worker, drop_last=True, pin_memory=True, prefetch_factor=batch_size//num_workers)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn_precomputed_embeddings, num_workers=num_workers, worker_init_fn=seed_worker, pin_memory=True, prefetch_factor=batch_size//num_workers)
+
+    return train_loader, test_loader, label_mapping
+
+def prepare_dataloader_precomputed_perceiver_embeddings(dataset, test_size=0.2, batch_size=128, shuffle=True, num_workers=4, worker_init_fn=seed_worker, drop_last=False, num_batches=-1):
     imu_x_data = []
     video_class_data = []
     video_perceiver_data = []
@@ -352,7 +415,7 @@ def prepare_dataloader_precomputed_perceiver_embeddings(dataset, test_size=0.2, 
         video_class_data.append(video_class)
         video_perceiver_data.append(video_perceiver)
         
-        activity_name = key.split('_')[-1]
+        activity_name = '_'.join(key.split('_')[3:]).lower()
         if activity_name not in label_mapping:
             label_mapping[activity_name] = label_count
             label_count += 1
@@ -362,14 +425,22 @@ def prepare_dataloader_precomputed_perceiver_embeddings(dataset, test_size=0.2, 
     # Split the data
     imu_train, imu_test, video_class_train, video_class_test, video_perceiver_train, video_perceiver_test, y_train, y_test = train_test_split(
         imu_x_data, video_class_data, video_perceiver_data, y_data, test_size=test_size, random_state=42)
-
+    
+    num_samples = len(imu_train) if batch_size*num_batches > len(imu_train) or num_batches==-1 else batch_size*num_batches
+    random_indices = random.sample(range(len(imu_train)), num_samples)
+    
+    imu_train = [imu_train[i] for i in random_indices]
+    video_class_train = [video_class_train[i] for i in random_indices]
+    video_perceiver_train = [video_perceiver_train[i] for i in random_indices]
+    y_train = [y_train[i] for i in random_indices]
+    
     y_train = torch.tensor(y_train, dtype=torch.int64)
     y_test = torch.tensor(y_test, dtype=torch.int64)
 
     train_dataset = Video_Perceiver_Dataset(imu_train, video_class_train, video_perceiver_train, y_train)
     test_dataset = Video_Perceiver_Dataset(imu_test, video_class_test, video_perceiver_test, y_test)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn_precomputed_perceiver_embeddings, num_workers=num_workers, worker_init_fn=seed_worker, drop_last=True, pin_memory=True, prefetch_factor=batch_size//num_workers)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn_precomputed_perceiver_embeddings, num_workers=num_workers, worker_init_fn=seed_worker, pin_memory=True, prefetch_factor=batch_size//num_workers)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn_precomputed_perceiver_embeddings, num_workers=num_workers, worker_init_fn=seed_worker, drop_last=drop_last, pin_memory=True, prefetch_factor=batch_size//num_workers)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn_precomputed_perceiver_embeddings, num_workers=num_workers, worker_init_fn=seed_worker, pin_memory=True, prefetch_factor=batch_size//num_workers, drop_last=drop_last)
 
     return train_loader, test_loader, label_mapping
