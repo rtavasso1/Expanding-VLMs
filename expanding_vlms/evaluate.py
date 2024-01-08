@@ -18,16 +18,6 @@ import argparse
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-run_names = {0: {'name': 'vital-sweep-15', 'path': '../Checkpoints/9sf4pyuw/vital-sweep-15/epoch160_avg_train_loss_0.774.pt'},
-             1: {'name': 'exalted-sweep-30', 'path': 'firstTest/Expanding-VLMs/Checkpoints/9sf4pyuw/exalted-sweep-30/epoch200_avg_train_loss_0.916.pt'},
-             2: {'name': 'youthful-sweep-77', 'path': 'firstTest/Expanding-VLMs/Checkpoints/rjujwu12/youthful-sweep-77/epoch300_avg_train_loss_2.045.pt'},
-             3: {'name': 'lemon-sweep-1', 'path': 'firstTest/Expanding-VLMs/Checkpoints/mf5mnb1j/lemon-sweep-1/epoch490_avg_train_loss_4.026.pt'},
-             4: {'name': 'classic-sweep-36', 'path': '../Checkpoints/km7s9903/classic-sweep-36/epoch250_avg_train_loss_4.051.pt'},
-             5: {'name': 'good-sweep-1', 'path': '../Checkpoints/764jxsre/good-sweep-1/epoch610_avg_train_loss_2.982.pt'},
-             6: {'name': 'peachy-sweep-1', 'path': '../Checkpoints/ybhzyc1f/peachy-sweep-1/epoch90_avg_train_loss_5.570.pt'}}
-
-
-
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def get_metrics(model, dataloader, lossfcn, device, config, sequence_wise):
@@ -81,62 +71,6 @@ def get_metrics(model, dataloader, lossfcn, device, config, sequence_wise):
         recall_test_averaged = {key: sum(value) / len(value) for key, value in recall_tests.items()}
 
     return recall_test_averaged
-
-@dataclass
-class Config:
-    token_num: List[int] = field(default_factory=list)
-    combined_encoders: bool = True
-    virtual_batch_size: int = -1
-    supervised_on_perceiver: bool = False
-    metrics_on_perceiver: bool = False
-    use_perceiver: bool = False
-    use_perceiver_on_video_only: bool = True
-    contrast_on_sequence: bool = True
-    use_contrastive_loss: bool = True
-    use_supervised_loss: bool = True
-    k: List[int] = field(default_factory=list)
-
-    def __post_init__(self):
-        if not self.token_num:
-            self.token_num = [i for i in range(64)]
-        if not self.k:
-            self.k = [1, 5, 10]
-
-def oldMain():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--run_number', type=int, default=0)
-    args = parser.parse_args()
-
-    config = runs_of_interest[run_names[args.run_number]['name']]
-
-    lossfcn = torch.nn.CrossEntropyLoss()
-
-    for sequence_wise, num_class_tokens, path in zip([True, False],[257,257],[path, None]):
-        dataset = load_all_data(root_dirs, video_root_dir, path=path)
-        train_dataloader, test_dataloader, label_mapping = prepare_dataloader_precomputed_perceiver_embeddings(dataset, batch_size=256, num_workers=4)
-
-        model = perceivingContrastive(patch_size=config['patch_size']['value'],
-                                         width=config['width']['value'],
-                                         dropout=config['dropout']['value'],
-                                         padding=config['padding']['value'],
-                                         num_class_tokens=num_class_tokens).to(device)
-
-        checkpoint = torch.load(run_names[args.run_number]['path'])
-        state_dict = checkpoint['model_state_dict']
-
-        #if sequence_wise:
-        #    cls_token = state_dict['cls_token']
-        #    repeated_cls_token = cls_token.repeat(1, 257, 1)  # Repeat along dim1
-        #    state_dict['cls_token'] = repeated_cls_token
-
-        #    adjusted_pos_embedding = torch.cat([pos_embedding, torch.zeros(256, 128)], dim=0) 
-        #    state_dict['pos_embedding'] = adjusted_pos_embedding
-
-        model.imu_encoder.load_state_dict(state_dict)
-
-
-        metrics = get_metrics(model, test_dataloader, lossfcn, device, config, sequence_wise)
-        print(metrics)
 
 @dataclass
 class VTConfig:
@@ -196,8 +130,6 @@ runs = {0: (CombinedVisionTransformers, VTConfig(combined_encoders=True), None),
         25: (VisionTransformer, VTConfig(path='../Checkpoints/uaq2a9ie/sweepy-sweep-9/epoch180_avg_train_loss_7.084.pt', width=1024), None), # batch 1024
        }
         
-# [, , , , , , , , ]
-        
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--run_number', type=int, default=0)
@@ -205,7 +137,6 @@ if __name__ == "__main__":
     model_class, *configs = runs[args.run_number]
     
     for i, config in enumerate(configs):
-        #if i==0: continue
         if config is None: continue
         model = model_class(**config.__dict__)
         
